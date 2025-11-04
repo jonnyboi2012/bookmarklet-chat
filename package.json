@@ -1,0 +1,16 @@
+{
+  "name": "bookmarklet-chat-server",
+  "version": "1.0.0",
+  "description": "Bookmarklet chat server with admin commands for Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
