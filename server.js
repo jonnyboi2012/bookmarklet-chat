@@ -1,159 +1,124 @@
 // server.js
-import express from "express";
-import http from "http";
-import { Server } from "socket.io";
-import cors from "cors";
-import fs from "fs";
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const { Server } = require("socket.io");
 
 const app = express();
-const server = http.createServer(app);
-
-// Allow bookmarklets ("null" origin) and all browsers
-app.use(cors({
-  origin: ["*", "null"],
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"],
-  credentials: true
-}));
-
-// Socket.IO server with same CORS config
-const io = new Server(server, {
-  cors: {
-    origin: ["*", "null"],
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
-    credentials: true
-  }
-});
-
-const PORT = 8080; // <- your preferred port
-
-// Persistent storage
-const DATA_FILE = "./bans.txt";
-let banned = {};
-if (fs.existsSync(DATA_FILE)) {
-  try { banned = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
-  catch { banned = {}; }
-}
-
-function saveBans() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(banned, null, 2));
-}
-
-// Reset bans at midnight PDT
-function scheduleReset() {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(24, 0, 0, 0);
-  const ms = next - now;
-  setTimeout(() => {
-    banned = {};
-    saveBans();
-    console.log("Bans reset at midnight PDT");
-    scheduleReset();
-  }, ms);
-}
-scheduleReset();
-
-// Chat state
-let messages = [];
-let clients = {};
-
-const ADMINS = ["Jonny_Boi", "AceLemming", "Owen"];
-const ADMIN_PASSWORD = "BuB123";
-const DELETE_ALL_PASSWORD = "Lyyq831028*";
-
-// Root endpoint
+app.use(cors());
 app.get("/", (req, res) => res.send("Bookmarklet Chat Server Running ✅"));
 
-// Socket.IO connection
-io.on("connection", socket => {
-  const { nickname, fingerprint } = socket.handshake.auth || {};
-  clients[socket.id] = { nickname, fingerprint };
+const server = http.createServer(app);
 
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+});
+
+// ===== Memory storage =====
+const messages = [];
+const banned = {}; // fingerprint -> nickname
+const loggedInAdmins = {}; // socket.id -> true if logged in
+
+const ADMIN_NAMES = ["Jonny_Boi", "AceLemming", "Owen"];
+const ADMIN_PASSWORD = "BuB123";
+
+// Midnight reset (PDT)
+setInterval(() => {
+  const now = new Date();
+  if (now.getHours() === 0 && now.getMinutes() === 0) {
+    Object.keys(banned).forEach((fp) => delete banned[fp]);
+    console.log("Midnight reset complete, bans cleared.");
+  }
+}, 60 * 1000);
+
+io.on("connection", (socket) => {
+  const { nickname, fingerprint } = socket.handshake.auth || {};
+
+  // Check ban
   if (banned[fingerprint]) {
-    socket.emit("force-close", "You have been banned until midnight.");
+    socket.emit("banned");
     socket.disconnect(true);
     return;
   }
 
-  socket.emit("message-history", messages);
-  socket.broadcast.emit("system", { text: `${nickname} joined`, time: new Date().toLocaleTimeString() });
+  // Send message history
+  socket.emit("loadMessages", messages);
 
-  socket.on("message", msg => {
-    const text = msg.text.trim();
+  socket.on("message", (data) => {
+    const msgText = data.text.trim();
+    const lower = msgText.toLowerCase();
 
-    // Admin commands
-    if (ADMINS.includes(nickname)) {
-      if (text.startsWith("/kick ")) {
-        const targetNick = text.split(" ")[1];
-        const target = Object.entries(clients).find(([id, c]) => c.nickname === targetNick);
-        if (target) {
-          io.to(target[0]).emit("force-close", "You have been kicked.");
-          io.sockets.sockets.get(target[0])?.disconnect(true);
-          io.emit("system", { text: `${targetNick} was kicked by ${nickname}`, time: new Date().toLocaleTimeString() });
-        }
-        return;
+    // --- /login ---
+    if (lower.startsWith("/login")) {
+      const parts = msgText.split(" ");
+      const password = parts[1];
+      if (
+        ADMIN_NAMES.includes(nickname) &&
+        password === ADMIN_PASSWORD
+      ) {
+        loggedInAdmins[socket.id] = true;
+        socket.emit("system", "✅ Logged in as admin.");
+      } else {
+        socket.emit("system", "❌ Incorrect password or not an admin name.");
       }
-
-      if (text.startsWith("/ban ")) {
-        const targetNick = text.split(" ")[1];
-        const target = Object.entries(clients).find(([id, c]) => c.nickname === targetNick);
-        if (target) {
-          const fp = target[1].fingerprint;
-          banned[fp] = { nickname: targetNick, time: Date.now() };
-          saveBans();
-          io.to(target[0]).emit("force-close", "You have been banned until midnight.");
-          io.sockets.sockets.get(target[0])?.disconnect(true);
-          io.emit("system", { text: `${targetNick} was banned by ${nickname}`, time: new Date().toLocaleTimeString() });
-        }
-        return;
-      }
-
-      if (text.startsWith("/unban ")) {
-        const arg = text.split(" ")[1];
-        let fpKey = null;
-        for (const [fp, info] of Object.entries(banned)) {
-          if (fp === arg || info.nickname === arg) {
-            fpKey = fp;
-            break;
-          }
-        }
-        if (fpKey) {
-          const unbannedNick = banned[fpKey].nickname;
-          delete banned[fpKey];
-          saveBans();
-          io.emit("system", { text: `${unbannedNick} was unbanned by ${nickname}`, time: new Date().toLocaleTimeString() });
-        } else {
-          socket.emit("system", { text: `No ban found for ${arg}`, time: new Date().toLocaleTimeString() });
-        }
-        return;
-      }
-
-      if (text === `/deleteall ${DELETE_ALL_PASSWORD}`) {
-        messages = [];
-        io.emit("message-history", []);
-        io.emit("system", { text: `💥 All messages deleted by ${nickname}`, time: new Date().toLocaleTimeString() });
-        return;
-      }
+      return;
     }
 
-    // Normal message
-    const m = {
+    // --- if this is an admin command ---
+    if (msgText.startsWith("/")) {
+      if (!loggedInAdmins[socket.id]) {
+        // Not logged in → treat as normal message
+        const msg = {
+          nickname,
+          text: msgText,
+          time: new Date().toLocaleTimeString("en-US", {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        };
+        messages.push(msg);
+        io.emit("message", msg);
+        return;
+      }
+
+      const [cmd, arg] = msgText.split(" ");
+      if (cmd === "/ban" && arg) {
+        banned[arg] = nickname;
+        io.emit("system", `${arg} was banned by ${nickname}`);
+        return;
+      }
+      if (cmd === "/unban" && arg) {
+        delete banned[arg];
+        io.emit("system", `${arg} was unbanned by ${nickname}`);
+        return;
+      }
+      if (cmd === "/deleteall") {
+        messages.length = 0;
+        io.emit("clearchat");
+        return;
+      }
+
+      socket.emit("system", "Unknown admin command.");
+      return;
+    }
+
+    // --- normal chat message ---
+    const msg = {
       nickname,
-      text,
-      time: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+      text: msgText,
+      time: new Date().toLocaleTimeString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
     };
-    messages.push(m);
-    if (messages.length > 200) messages.shift();
-    io.emit("message", m);
+    messages.push(msg);
+    io.emit("message", msg);
   });
 
   socket.on("disconnect", () => {
-    const n = clients[socket.id]?.nickname;
-    delete clients[socket.id];
-    io.emit("system", { text: `${n} left`, time: new Date().toLocaleTimeString() });
+    delete loggedInAdmins[socket.id];
   });
 });
 
-server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log(`Server running on ${PORT}`));
